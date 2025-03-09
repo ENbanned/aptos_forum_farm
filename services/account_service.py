@@ -307,23 +307,24 @@ class AccountService:
                 
                 openai_model = self.openai_model
                 
-                config_proxy = None
+                proxy_config = None
                 if self.config:
                     try:
-                        config_proxy = self.config.get_openai_proxy_config()
-                        if config_proxy:
-                            logger.info(f"Доступны прокси OpenAI из конфигурации: {config_proxy.get('host')}:{config_proxy.get('port')}")
+                        proxy_enabled = self.config.get("openai", "proxy", {}).get("enabled", False)
+                        
+                        if proxy_enabled:
+                            proxy_config = self.config.get_openai_proxy_config()
+                            if proxy_config:
+                                logger.info(f"Используем прокси OpenAI из конфигурации: {proxy_config.get('host')}:{proxy_config.get('port')}")
+                        else:
+                            logger.info("Прокси OpenAI отключен в конфигурации, запросы будут без прокси")
                     except Exception as e:
                         logger.error(f"Ошибка при получении прокси OpenAI из конфигурации: {str(e)}")
-                
-                account_proxy = self._parse_proxy_config(account.proxy)
-                
-                proxy_config = account_proxy or config_proxy
                 
                 if proxy_config:
                     logger.info(f"Используются прокси для OpenAI: {proxy_config.get('host')}:{proxy_config.get('port')}")
                 else:
-                    logger.warning("Прокси для OpenAI не указаны ни в аккаунте, ни в конфигурации")
+                    logger.info("Прокси для OpenAI не используется")
                 
                 comment_generator = create_comment_generator(
                     api_key=self.openai_api_key,

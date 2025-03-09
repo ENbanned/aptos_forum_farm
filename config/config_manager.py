@@ -108,17 +108,25 @@ class ConfigManager:
         return self.get("openai", "api_key", "")
     
     
-    def get_openai_proxy_config(self) -> Dict[str, Any]:
-        proxy_config = self.get("openai", "proxy", {})
-        if not proxy_config.get("enabled", False):
+    def get_openai_proxy_config(self) -> Optional[Dict[str, Any]]:
+        try:
+            proxy_config = self.get("openai", "proxy", {})
+            if not isinstance(proxy_config, dict):
+                return None
+                
+            if not proxy_config.get("enabled", False):
+                return None
+                
+            return {
+                "host": proxy_config.get("host", ""),
+                "port": proxy_config.get("port", ""),
+                "username": proxy_config.get("username", ""),
+                "password": proxy_config.get("password", ""),
+                "type": proxy_config.get("type", "http")
+            }
+        except Exception as e:
+            logger.error(f"Ошибка при получении конфигурации прокси OpenAI: {str(e)}")
             return None
-        return {
-            "host": proxy_config.get("host", ""),
-            "port": proxy_config.get("port", ""),
-            "username": proxy_config.get("username", ""),
-            "password": proxy_config.get("password", ""),
-            "type": proxy_config.get("type", "http")
-        }
     
     
     def get_logging_config(self) -> Dict[str, Any]:

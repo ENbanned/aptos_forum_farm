@@ -244,7 +244,6 @@ class AptosForumClient:
                 
                 if data.get("status") == "success" and "timezone" in data:
                     timezone = data["timezone"]
-                    # Сохраняем в кэш
                     self._ip_timezone_cache[ip_address] = timezone
                     return timezone
                     
@@ -518,57 +517,134 @@ class AptosForumClient:
     @require_authentication
     @handle_api_errors
     async def simulate_online_presence(self, duration_minutes: int = 30) -> None:
+
         logger.info(f"Начинаем симуляцию онлайн-активности на {duration_minutes} минут")
         
         end_time = time.time() + duration_minutes * 60
         poll_count = 0
         
-        topic = await self.get_random_topic(min_posts=2)
-        if not topic:
-            logger.error("Не удалось получить случайную тему для онлайн-присутствия")
-            return
-        
-        logger.info(f"Выбрана тема для симуляции онлайн: {topic.title} (ID: {topic.id})")
-        
-        initial_response = await self._client.get(f"{self.base_url}/t/{topic.id}")
-        
-        username_hash = hashlib.md5(str(self._username).encode()).hexdigest()
-        message_bus_id = username_hash[:32]
-        logger.info(f"Сгенерирован message-bus ID: {message_bus_id}")
-        
         try:
+            get_topic_task = asyncio.wait_for(
+                self.get_random_topic(min_posts=2),
+                timeout=40
+            )
+            
+            try:
+                topic = await get_topic_task
+            except asyncio.TimeoutError:
+                logger.warning("Таймаут при получении случайной темы. Выбираем тему по умолчанию.")
+                topic = TopicData(id=9349, title="Important Notice", posts_count=20)
+            
+            if not topic or not topic.id:
+                logger.error("Не удалось получить ID темы для онлайн-присутствия")
+                topic = TopicData(id=9349, title="Important Notice", posts_count=20)
+            
+            logger.info(f"Выбрана тема для симуляции онлайн: {topic.title or 'Без названия'} (ID: {topic.id})")
+            
+            try:
+                initial_response = await asyncio.wait_for(
+                    self._client.get(f"{self.base_url}/t/{topic.id}"),
+                    timeout=40
+                )
+                
+                if initial_response.status_code != 200:
+                    logger.warning(f"Не удалось загрузить начальную страницу темы. Статус: {initial_response.status_code}")
+            except Exception as e:
+                logger.warning(f"Ошибка при загрузке начальной страницы темы: {e}")
+            
+            if self._username:
+                username_hash = hashlib.md5(str(self._username).encode()).hexdigest()
+                message_bus_id = username_hash[:32]
+            else:
+                message_bus_id = hashlib.md5(str(random.random()).encode()).hexdigest()[:32]
+                
+            logger.info(f"Сгенерирован message-bus ID: {message_bus_id}")
+            
             seq_num = 1
             last_timing_time = 0
+            last_auth_check_time = time.time()
+            
+            auth_check_interval = 120  
+            poll_interval = random.uniform(40, 60) 
             
             while time.time() < end_time:
-                if poll_count % 10 == 0 and poll_count > 0:
-                    if not await self._check_authentication():
-                        logger.warning("Потеряна авторизация, выполняем повторный вход")
-                        if not await self._ensure_authenticated():
-                            logger.error("Не удалось восстановить авторизацию, прерываем симуляцию")
-                            return
-                
-                poll_result = await self._send_poll_request(message_bus_id, seq_num, topic.id)
-                logger.info(f"Poll request #{seq_num}, статус: {poll_result}")
-                seq_num += 1
-                poll_count += 1
-                
                 current_time = time.time()
-                if current_time - last_timing_time > random.uniform(30, 50):
-                    post_numbers = range(1, min(5, topic.posts_count or 5) + 1)
-                    timings = {str(i): random.randint(1000, 15000) for i in post_numbers}
-                    topic_time = sum(timings.values())
-                    
-                    timing_result = await self._send_timing_data(topic.id, timings, topic_time)
-                    logger.info(f"Timing data отправлен, статус: {timing_result}, время: {topic_time}ms")
-                    last_timing_time = current_time
                 
-                await asyncio.sleep(random.uniform(20, 40))
+                if current_time - last_auth_check_time > auth_check_interval:
+                    try:
+                        auth_ok = await asyncio.wait_for(
+                            self._check_authentication(),
+                            timeout=40
+                        )
+                        
+                        if not auth_ok:
+                            logger.warning("Потеряна авторизация, выполняем повторный вход")
+                            
+                            reauth_ok = await asyncio.wait_for(
+                                self._ensure_authenticated(),
+                                timeout=40
+                            )
+                            
+                            if not reauth_ok:
+                                logger.error("Не удалось восстановить авторизацию, прерываем симуляцию")
+                                return
+                        
+                        last_auth_check_time = current_time
+                        
+                    except Exception as e:
+                        logger.warning(f"Ошибка при проверке авторизации: {e}")
+                
+                try:
+                    poll_result = await self._send_poll_request(message_bus_id, seq_num, topic.id)
+                    logger.info(f"Poll request #{seq_num}, статус: {poll_result}")
+                    seq_num += 1
+                    poll_count += 1
+                    
+                    if current_time - last_timing_time > random.uniform(45, 75):
+                        post_count = min(5, topic.posts_count or 5)
+                        post_numbers = range(1, post_count + 1)
+                        
+                        timings = {}
+                        for post_num in post_numbers:
+                            if post_num == 1:
+                                timings[str(post_num)] = random.randint(5000, 20000)
+                            else:
+                                timings[str(post_num)] = random.randint(3000, 15000)
+                        
+                        topic_time = sum(timings.values())
+                        
+                        timing_result = await self._send_timing_data(topic.id, timings, topic_time)
+                        logger.info(f"Timing data отправлен, статус: {timing_result}, время: {topic_time}ms")
+                        last_timing_time = current_time
+                    
+                    await asyncio.sleep(poll_interval)
+                    poll_interval = random.uniform(40, 70)
+                    
+                except asyncio.CancelledError:
+                    logger.info("Симуляция онлайн-присутствия отменена")
+                    raise
+                    
+                except Exception as e:
+                    logger.warning(f"Ошибка в цикле симуляции: {str(e)}")
+                    await asyncio.sleep(15)
+                    
+                    if poll_count % 5 == 0:
+                        try:
+                            logger.info("Пробуем обновить сессию")
+                            self._csrf_token = await self._get_csrf_token_from_api()
+                            if self._csrf_token:
+                                self._client.update_headers({"x-csrf-token": self._csrf_token})
+                        except Exception as refresh_error:
+                            logger.warning(f"Ошибка при обновлении сессии: {refresh_error}")
             
             logger.success(f"Симуляция онлайн-присутствия завершена. Отправлено {poll_count} запросов.")
             
+        except asyncio.CancelledError:
+            logger.info("Симуляция онлайн-присутствия отменена")
+            raise
+            
         except Exception as e:
-            logger.error(f"Ошибка при симуляции онлайн-присутствия: {e}")
+            logger.error(f"Ошибка при симуляции онлайн-присутствия: {str(e)}")
     
     
     @require_authentication
@@ -659,52 +735,81 @@ class AptosForumClient:
         try:
             if not self._client:
                 return False
-                
+                    
             poll_url = f"{self.base_url}/message-bus/{message_bus_id}/poll"
             
+            username = self._username or "user"
+            
             data = {
-                '/latest': '7073',
-                '/new': '719',
-                '/unread': '2770',
-                f'/unread/{self._username}': '0',
+                '/latest': str(random.randint(7000, 7500)),
+                '/new': str(random.randint(700, 800)),
+                '/unread': str(random.randint(2700, 2800)),
+                f'/unread/{username}': str(random.randint(0, 30)),
                 '/delete': '0',
                 '/recover': '0',
                 '/destroy': '0',
                 '/site/banner': '0',
                 '/file-change': '0',
-                f'/logout/{self._username}': '0',
+                f'/logout/{username}': '0',
                 '/site/read-only': '0',
-                f'/reviewable_counts/{self._username}': '0',
-                f'/notification/{self._username}': '0',
-                f'/user-drafts/{self._username}': '0',
-                f'/do-not-disturb/{self._username}': '0',
+                f'/reviewable_counts/{username}': '0',
+                f'/notification/{username}': str(random.randint(0, 2)),
+                f'/user-drafts/{username}': '0',
+                f'/do-not-disturb/{username}': '0',
                 '/user-status': '0',
-                '/categories': '1385',
+                '/categories': str(random.randint(1300, 1500)),
                 '/client_settings': '0',
-                f'/notification-alert/{self._username}': '0',
+                f'/notification-alert/{username}': '0',
                 '/refresh_client': '0',
-                '/global/asset-version': '1738',
+                '/global/asset-version': str(random.randint(1730, 1750)),
                 '/refresh-sidebar-sections': '0',
-                f'/topic/{topic_id}': str(random.randint(20, 60)),
+                f'/topic/{topic_id}': str(random.randint(30, 11000)),
                 f'/polls/{topic_id}': '0',
                 f'/discourse-akismet/topic-deleted/{topic_id}': '0',
                 f'/presence/discourse-presence/reply/{topic_id}': '0',
                 '__seq': str(seq_num)
             }
             
-            form_data = '&'.join([f"{quote(key)}={quote(value)}" for key, value in data.items()])
+            form_data = '&'.join([f"{quote(key, safe='')}={quote(str(value), safe='')}" for key, value in data.items()])
             
             headers = {
                 'accept': 'text/plain, */*; q=0.01',
                 'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
                 'discourse-present': 'true',
+                'origin': self.base_url,
+                'referer': f"{self.base_url}/t/{topic_id}",
+                'sec-ch-ua': '"Chromium";v="134", "Not:A-Brand";v="24", "Google Chrome";v="134"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Windows"',
+                'sec-fetch-dest': 'empty',
+                'sec-fetch-mode': 'cors',
+                'sec-fetch-site': 'same-origin',
+                'x-requested-with': 'XMLHttpRequest',
                 'x-silence-logger': 'true'
             }
             
-            response = await self._client.post(poll_url, data=form_data, headers=headers)
+            if self._csrf_token:
+                headers['x-csrf-token'] = self._csrf_token
+            
+            response = await asyncio.wait_for(
+                self._client.post(poll_url, data=form_data, headers=headers),
+                timeout=60
+            )
+            
             logger.debug(f"_send_poll_request - статус: {response.status_code}")
             
-            return response.status_code == 200
+            if response.status_code == 200:
+                response_text = response.text
+                if response_text and len(response_text.strip()) > 0:
+                    logger.debug(f"Poll ответ получен: {response_text[:100]}...")
+                return True
+            else:
+                logger.warning(f"Ошибка poll-запроса: HTTP {response.status_code}")
+                return False
+                
+        except asyncio.TimeoutError:
+            logger.warning("Таймаут при отправке poll-запроса")
+            return False
         except Exception as e:
             logger.error(f"Ошибка при отправке poll-запроса: {e}")
             return False
@@ -732,12 +837,19 @@ class AptosForumClient:
                 'x-silence-logger': 'true'
             }
             
-            response = await self._client.post(url, data=data, headers=headers)
+            response = await asyncio.wait_for(
+                self._client.post(url, data=data, headers=headers),
+                timeout=15
+            )
+            
             logger.debug(f"_send_timing_data - статус: {response.status_code}")
             
             return response.status_code == 200
+        except asyncio.TimeoutError:
+            logger.warning("Таймаут при отправке данных о времени просмотра")
+            return False
         except Exception as e:
-            logger.error(f"Ошибка при отправке данных о времени просмотра: {e}")
+            logger.error(f"Ошибка при отправке данных о времени просмотра: {str(e)}")
             return False
 
 

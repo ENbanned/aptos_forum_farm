@@ -1,8 +1,11 @@
 import asyncio
 import sys
 import os
+import time
 import traceback
+import signal
 from pathlib import Path
+from contextlib import suppress
 
 from config.config_manager import ConfigManager
 from config.logging_config import logger
@@ -12,7 +15,6 @@ from services.scheduler import TaskScheduler
 
 
 def setup_application() -> tuple:
-
     files_dir = Path("files")
     files_dir.mkdir(exist_ok=True)
     
@@ -51,7 +53,26 @@ def setup_application() -> tuple:
     return account_service, scheduler, config
 
 
+def setup_signal_handlers(shutdown_event):
+    
+    def signal_handler(*args):
+        logger.info("\nПолучен сигнал завершения, останавливаем приложение...")
+        shutdown_event.set()
+    
+    if sys.platform == 'win32':
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+    else:
+        loop = asyncio.get_event_loop()
+        loop.add_signal_handler(signal.SIGINT, signal_handler)
+        loop.add_signal_handler(signal.SIGTERM, signal_handler)
+
+
 async def main_async():
+    shutdown_event = asyncio.Event()
+    
+    setup_signal_handlers(shutdown_event)
+    
     try:
         account_service, scheduler, config = setup_application()
         
@@ -64,7 +85,7 @@ async def main_async():
  ╚═╝  ╚═╝╚═╝        ╚═╝    ╚═════╝ ╚══════╝╚═╝╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝
 """
 
-        while True:
+        while not shutdown_event.is_set():
             if sys.platform.startswith('win'):
                 os.system('cls')
             else:
@@ -84,7 +105,28 @@ async def main_async():
             print("0. Выход\033[0m")
             print("\033[90m{:-^80}\033[0m".format(""))
             
-            choice = input("\n\033[93mВведите номер операции > \033[0m")
+            user_input_task = asyncio.create_task(wait_for_user_input("\n\033[93mВведите номер операции > \033[0m"))
+            wait_event_task = asyncio.create_task(wait_for_event(shutdown_event))
+            
+            done, pending = await asyncio.wait(
+                [user_input_task, wait_event_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            for task in pending:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+            
+            if shutdown_event.is_set():
+                break
+            
+            choice = ""
+            for task in done:
+                try:
+                    choice = task.result()
+                except Exception:
+                    pass
             
             if choice == "1":
                 csv_path = Path("files") / "accounts.csv"
@@ -117,21 +159,26 @@ async def main_async():
                     print(f"\033[91mОшибка: {str(e)}\033[0m")
                 
                 print("\n\033[94mНажмите Enter чтобы продолжить...\033[0m")
-                input()
+                await wait_for_enter()
                 
             elif choice == "2":
                 logger.info("\nЗапуск планировщика...")
                 await scheduler.start()
                 logger.success("\nПланировщик запущен. Нажмите Ctrl+C для завершения.")
                 
+                watchdog_task = asyncio.create_task(scheduler_watchdog(scheduler))
+                
                 try:
-                    while True:
-                        await asyncio.sleep(60)
-                except KeyboardInterrupt:
+                    while not shutdown_event.is_set():
+                        await asyncio.sleep(1)
+                finally:
+                    watchdog_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await watchdog_task
+                    
                     logger.info("\nОстановка планировщика...")
                     await scheduler.stop()
                     logger.info("Планировщик остановлен.")
-                    break
                 
             elif choice == "0":
                 logger.info("\nЗавершение работы программы...")
@@ -151,12 +198,63 @@ async def main_async():
         sys.exit(1)
 
 
+async def wait_for_user_input(prompt):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, input, prompt)
+
+
+async def wait_for_enter():
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, input)
+
+
+async def wait_for_event(event):
+    await event.wait()
+    return ""
+
+
+async def scheduler_watchdog(scheduler, check_interval=300):
+    last_check_time = time.time()
+    
+    while True:
+        try:
+            if not scheduler.running:
+                logger.warning("Сторожевой таймер: Планировщик не запущен, перезапускаем...")
+                await scheduler.start()
+            
+            current_time = time.time()
+            if current_time - last_check_time > check_interval:
+                logger.info("Сторожевой таймер: Проверка работоспособности планировщика...")
+                
+                last_check_time = current_time
+            
+            await asyncio.sleep(60)
+            
+        except asyncio.CancelledError:
+            logger.info("Сторожевой таймер планировщика остановлен")
+            break
+        except Exception as e:
+            logger.error(f"Ошибка в сторожевом таймере планировщика: {str(e)}")
+            await asyncio.sleep(60)
+
+
 def main():
     try:
         files_dir = Path("files")
         files_dir.mkdir(exist_ok=True)
         
-        asyncio.run(main_async())
+        if sys.version_info >= (3, 8):
+            loop_policy = asyncio.get_event_loop_policy()
+            loop = loop_policy.new_event_loop()
+            loop.set_exception_handler(custom_exception_handler)
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(main_async())
+            loop.close()
+        else:
+            loop = asyncio.get_event_loop()
+            loop.set_exception_handler(custom_exception_handler)
+            loop.run_until_complete(main_async())
+            loop.close()
         
     except KeyboardInterrupt:
         logger.info("\nЗавершение работы приложения...")
@@ -167,6 +265,19 @@ def main():
         sys.exit(1)
 
 
+def custom_exception_handler(loop, context):
+    exception = context.get('exception')
+    message = context.get('message')
+    
+    if isinstance(exception, asyncio.CancelledError):
+        logger.debug(f"Задача отменена: {message}")
+        return
+        
+    logger.error(f"Необработанное исключение в асинхронном коде: {message}")
+    if exception:
+        logger.error(f"Исключение: {exception}")
+        logger.error(f"Трассировка: {traceback.format_exception(type(exception), exception, exception.__traceback__)}")
+
+
 if __name__ == "__main__":
     main()
-    

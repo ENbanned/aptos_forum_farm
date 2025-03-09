@@ -13,9 +13,20 @@ from social_clients.aptos_forum.client import AptosForumClient
 
 
 class AccountService:    
-    def __init__(self, db_manager: DatabaseManager, openai_api_key: str = ""):
+    def __init__(self, db_manager: DatabaseManager, openai_api_key: str = "", config = None):
         self.db_manager = db_manager
         self.openai_api_key = openai_api_key
+        self.config = config
+        
+        self.openai_model = "gpt-3.5-turbo"
+        if self.config:
+            try:
+                model = self.config.get("openai", "model")
+                if model:
+                    self.openai_model = model
+                    logger.info(f"Используется модель OpenAI из конфигурации: {self.openai_model}")
+            except Exception as e:
+                logger.error(f"Ошибка при загрузке модели OpenAI из конфигурации: {str(e)}")
     
     
     def get_active_accounts(self) -> List[Dict]:
@@ -72,6 +83,10 @@ class AccountService:
                 with self.db_manager.session_scope() as session:
                     repo = AccountRepository(session)
                     
+                    all_accounts = {}
+                    for acc in repo.get_all():
+                        all_accounts[acc.username.lower()] = acc
+                    
                     for row_idx, row in enumerate(reader, start=2):
                         try:
                             if not row or (len(row) < 2 and is_new_format) or (len(row) < 1 and not is_new_format):
@@ -116,7 +131,8 @@ class AccountService:
                                 if len(row) > 1 and row[1].strip():
                                     proxy = row[1].strip()
                             
-                            account = repo.get_by_username(username)
+                            username_lower = username.lower()
+                            account = all_accounts.get(username_lower)
                             
                             if account:
                                 account.password = password
@@ -128,6 +144,7 @@ class AccountService:
                             else:
                                 account = repo.create(username, password, proxy)
                                 repo.generate_activity_plan(account.id)
+                                all_accounts[username_lower] = account
                                 added += 1
                                 logger.info(f"Создан аккаунт: {username}")
                         except Exception as e:
@@ -288,10 +305,29 @@ class AccountService:
                 comments_count = day_plan['comments_planned']
                 logger.info(f"Написание {comments_count} комментариев")
                 
-                proxy_config = self._parse_proxy_config(account.proxy)
+                openai_model = self.openai_model
+                
+                config_proxy = None
+                if self.config:
+                    try:
+                        config_proxy = self.config.get_openai_proxy_config()
+                        if config_proxy:
+                            logger.info(f"Доступны прокси OpenAI из конфигурации: {config_proxy.get('host')}:{config_proxy.get('port')}")
+                    except Exception as e:
+                        logger.error(f"Ошибка при получении прокси OpenAI из конфигурации: {str(e)}")
+                
+                account_proxy = self._parse_proxy_config(account.proxy)
+                
+                proxy_config = account_proxy or config_proxy
+                
+                if proxy_config:
+                    logger.info(f"Используются прокси для OpenAI: {proxy_config.get('host')}:{proxy_config.get('port')}")
+                else:
+                    logger.warning("Прокси для OpenAI не указаны ни в аккаунте, ни в конфигурации")
+                
                 comment_generator = create_comment_generator(
                     api_key=self.openai_api_key,
-                    model="gpt-3.5-turbo",
+                    model=openai_model,
                     proxy_config=proxy_config
                 )
                 

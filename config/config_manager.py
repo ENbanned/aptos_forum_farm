@@ -43,7 +43,7 @@ class ConfigManager:
             },
             "scheduler": {
                 "enabled": True,
-                "random_start_window_hours": 24
+                "random_start_window_minutes": 300
             }
         }
     
@@ -133,5 +133,11 @@ class ConfigManager:
     
     
     def get_scheduler_config(self) -> Dict[str, Any]:
-        return self.get("scheduler", {})
+        scheduler_config = self.get("scheduler", {})
+        if not isinstance(scheduler_config, dict):
+            return {
+                "enabled": True,
+                "random_start_window_minutes": 300
+            }
+        return scheduler_config
     

@@ -2,6 +2,7 @@ import datetime
 import random
 from typing import List, Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from config.logging_config import logger
@@ -18,7 +19,14 @@ class AccountRepository:
     
     
     def get_by_username(self, username: str) -> Optional[Account]:
-        return self.session.query(Account).filter_by(username=username).first()
+        if not username:
+            return None
+        
+        account = self.session.query(Account).filter_by(username=username).first()
+        if account:
+            return account
+        
+        return self.session.query(Account).filter(func.lower(Account.username) == func.lower(username)).first()
     
     
     def get_all(self) -> List[Account]:

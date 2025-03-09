@@ -58,31 +58,49 @@ class AptosForumClient:
     # -------------------------------------------------------------------------
     
     async def start(self) -> bool:
-        try:
-            self._client = TLSClient(
-                proxy=self._proxy, 
-                disable_ssl=True,
-                randomize_fingerprint=True,
-                headers=self._get_default_headers()
-            )
-            
-            if not await self._ensure_authenticated():
-                logger.error("Не удалось выполнить авторизацию")
-                return False
-            
-            if not self._csrf_token:
-                self._csrf_token = await self._get_csrf_token_from_api()
-                if self._csrf_token:
-                    self._client.update_headers({"x-csrf-token": self._csrf_token})
-                else:
-                    logger.error("Не удалось получить CSRF токен")
+        max_attempts = 3
+        
+        for attempt in range(1, max_attempts + 1):
+            try:
+                logger.info(f"Попытка #{attempt} инициализации клиента для {self._credentials.username}" + 
+                        (f" с прокси {self._proxy}" if self._proxy else " без прокси"))
+                
+                self._client = TLSClient(
+                    proxy=self._proxy, 
+                    disable_ssl=True,
+                    randomize_fingerprint=True,
+                    headers=self._get_default_headers()
+                )
+                
+                if not await self._ensure_authenticated():
+                    logger.error(f"Не удалось выполнить авторизацию для {self._credentials.username}")
+                    if attempt < max_attempts:
+                        await asyncio.sleep(2)
+                        continue
                     return False
-                    
-            return True
-            
-        except Exception as e:
-            logger.error(f"Ошибка при инициализации клиента: {e}")
-            return False
+                
+                if not self._csrf_token:
+                    self._csrf_token = await self._get_csrf_token_from_api()
+                    if self._csrf_token:
+                        self._client.update_headers({"x-csrf-token": self._csrf_token})
+                    else:
+                        logger.error("Не удалось получить CSRF токен")
+                        if attempt < max_attempts:
+                            await asyncio.sleep(2)
+                            continue
+                        return False
+                
+                logger.success(f"Успешная инициализация клиента для {self._credentials.username}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Ошибка при инициализации клиента (попытка {attempt}/{max_attempts}): {str(e)}")
+                if attempt < max_attempts:
+                    await asyncio.sleep(2)
+                else:
+                    return False
+        
+        return False
     
     
     async def _ensure_authenticated(self) -> bool:

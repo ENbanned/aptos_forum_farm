@@ -63,27 +63,35 @@ class TLSClient:
         if not self._randomize_fingerprint:
             self.logger.debug("Обновление отпечатка пропущено, так как рандомизация отключена")
             return
+        
+        try:
+            random_headers, random_browser_type = FingerprintRandomizer.get_random_fingerprint()
             
-        random_headers, random_browser_type = FingerprintRandomizer.get_random_fingerprint()
-        
-        self._session.headers.clear()
-        self._session.headers.update(random_headers)
-        
-        old_session = self._session
-        
-        self._session = AsyncSession(
-            impersonate=random_browser_type,
-            headers=dict(self._session.headers),
-            proxies={"http": self._proxy, "https": self._proxy} if self._proxy else {},
-            verify=not DEFAULT_DISABLE_SSL,
-        )
-        
-        if inspect.iscoroutinefunction(old_session.close):
-            await old_session.close()
-        else:
-            old_session.close()
+            self._session.headers.clear()
+            self._session.headers.update(random_headers)
             
-        self.logger.debug(f"Отпечаток обновлен, новый User-Agent: {self._session.headers.get('User-Agent')}")
+            old_session = self._session
+            
+            try:
+                self._session = AsyncSession(
+                    impersonate=random_browser_type,
+                    headers=dict(self._session.headers),
+                    proxies={"http": self._proxy, "https": self._proxy} if self._proxy else {},
+                    verify=not DEFAULT_DISABLE_SSL,
+                )
+                
+                if inspect.iscoroutinefunction(old_session.close):
+                    await old_session.close()
+                else:
+                    old_session.close()
+                    
+                self.logger.debug(f"Отпечаток обновлен, новый User-Agent: {self._session.headers.get('User-Agent')}")
+            except Exception as e:
+                self._session = old_session
+                self.logger.error(f"Ошибка при обновлении сессии: {str(e)}")
+                
+        except Exception as e:
+            self.logger.error(f"Ошибка при обновлении отпечатка: {str(e)}")
 
 
     async def __aenter__(self) -> 'TLSClient':

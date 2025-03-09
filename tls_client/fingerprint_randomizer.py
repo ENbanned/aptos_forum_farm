@@ -42,9 +42,7 @@ class FingerprintRandomizer:
         browser_types = [
             BrowserType.chrome99, BrowserType.chrome100, BrowserType.chrome101, 
             BrowserType.chrome104, BrowserType.chrome107, BrowserType.chrome110, 
-            BrowserType.chrome116, BrowserType.chrome120, BrowserType.chrome122,
-            BrowserType.chrome124, BrowserType.chrome131, BrowserType.chrome134,
-            BrowserType.firefox102, BrowserType.firefox110, BrowserType.firefox113
+            BrowserType.chrome116, BrowserType.chrome120, BrowserType.chrome124
         ]
         return random.choice(browser_types)
     

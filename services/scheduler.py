@@ -54,21 +54,31 @@ class TaskScheduler:
                 account.next_run_time = None
             
             now = datetime.datetime.now()
-            active_count = len(active_accounts)
+            
+            # Значение по умолчанию
+            random_start_window_minutes = 300
+            
+            if self.config:
+                try:
+                    config_minutes = self.config.get("scheduler", "random_start_window_minutes", 300)
+                    if isinstance(config_minutes, (int, float)) and config_minutes > 0:
+                        random_start_window_minutes = int(config_minutes)
+                except Exception as e:
+                    logger.error(f"Ошибка при получении конфигурации планировщика: {str(e)}")
+            
+            all_delays = list(range(1, random_start_window_minutes + 1))
+            random.shuffle(all_delays)
             
             for i, account in enumerate(active_accounts):
-                if active_count > 1:
-                    base_hours = 0.1 + (0.2 * i / (active_count - 1))
-                    random_adjustment = random.uniform(-0.5, 0.5)
-                    delay_hours = max(0.5, base_hours + random_adjustment)
-                else:
-                    delay_hours = random.uniform(1, 3)
+                delay_idx = i % len(all_delays)
+                delay_minutes = all_delays[delay_idx]
+                delay_hours = delay_minutes / 60
                 
-                next_run = now + datetime.timedelta(hours=delay_hours)
+                next_run = now + datetime.timedelta(minutes=delay_minutes)
                 account.next_run_time = next_run
                 account.schedule_interval = random.uniform(22, 28)
                 
-                hour_str = f"{int(delay_hours)}ч {int((delay_hours*60) % 60)}м"
+                hour_str = f"{int(delay_hours)}ч {int(delay_minutes % 60)}м"
                 run_time = next_run.strftime('%H:%M:%S')
                 
                 logger.info(f"→ Аккаунт {account.username} запланирован на {run_time} (через {hour_str})")
@@ -112,18 +122,28 @@ class TaskScheduler:
                 if not account.next_run_time:
                     continue
                     
-                task_running = account.id in self.tasks
-                
-                if (account.next_run_time <= current_time and not task_running):
-                    accounts_to_run.append(account.id)
+                try:
+                    # Проверка, что id аккаунта - хешируемый тип
+                    account_id = account.id
+                    if not isinstance(account_id, (int, str, float, bool, tuple)):
+                        logger.error(f"Некорректный тип ID аккаунта {account.username}: {type(account_id)}")
+                        continue
                     
-                    delta = current_time - account.next_run_time
-                    minutes_ago = int(delta.total_seconds() / 60)
+                    task_running = account_id in self.tasks
                     
-                    if minutes_ago > 0:
-                        logger.info(f"Запуск {account.username} (запланирован {minutes_ago} мин. назад)")
-                    else:
-                        logger.info(f"Запуск {account.username} (время выполнения)")
+                    if (account.next_run_time <= current_time and not task_running):
+                        accounts_to_run.append(account_id)
+                        
+                        delta = current_time - account.next_run_time
+                        minutes_ago = int(delta.total_seconds() / 60)
+                        
+                        if minutes_ago > 0:
+                            logger.info(f"Запуск {account.username} (запланирован {minutes_ago} мин. назад)")
+                        else:
+                            logger.info(f"Запуск {account.username} (время выполнения)")
+                except TypeError as e:
+                    logger.error(f"Ошибка при проверке задачи для аккаунта {account.username}: {str(e)}")
+                    continue
         
         return accounts_to_run
         
@@ -131,15 +151,29 @@ class TaskScheduler:
     def _clean_completed_tasks(self):
         completed_ids = []
         for task_id, task in list(self.tasks.items()):
-            if task.done():
+            try:
+                if task.done():
+                    completed_ids.append(task_id)
+            except Exception as e:
+                logger.error(f"Ошибка при проверке задачи {task_id}: {str(e)}")
                 completed_ids.append(task_id)
                 
         for task_id in completed_ids:
-            if task_id in self.tasks:
-                task = self.tasks[task_id]
-                if task.exception():
-                    logger.error(f"Задача для аккаунта {task_id} завершилась с ошибкой: {task.exception()}")
-                del self.tasks[task_id]
+            try:
+                if task_id in self.tasks:
+                    task = self.tasks[task_id]
+                    try:
+                        if task.exception():
+                            logger.error(f"Задача для аккаунта {task_id} завершилась с ошибкой: {task.exception()}")
+                    except Exception as e:
+                        logger.error(f"Ошибка при получении исключения задачи {task_id}: {str(e)}")
+                    del self.tasks[task_id]
+            except Exception as e:
+                logger.error(f"Ошибка при удалении задачи {task_id}: {str(e)}")
+                try:
+                    self.tasks.pop(task_id, None)
+                except:
+                    pass
     
     
     async def _execute_account_tasks(self, account_id: int):

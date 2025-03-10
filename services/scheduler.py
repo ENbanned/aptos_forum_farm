@@ -59,9 +59,30 @@ class TaskWatchdog:
                     
                     if not task.done() and (now - start_time).total_seconds() > self.timeout_seconds:
                         logger.warning(f"Обнаружена зависшая задача: {description}. "
-                                      f"Выполняется {(now - start_time).total_seconds():.1f} секунд. Перезапуск...")
+                                    f"Выполняется {(now - start_time).total_seconds():.1f} секунд. Перезапуск...")
                         
                         task.cancel()
+                        
+                        # Если это основной цикл планировщика, создаем новый
+                        if task_id == -1 and description == "Основной цикл планировщика":
+                            # Дожидаемся завершения старой задачи
+                            try:
+                                await asyncio.wait_for(task, timeout=5.0)
+                            except (asyncio.CancelledError, asyncio.TimeoutError):
+                                pass
+                            
+                            # Создаем новый цикл планировщика
+                            from_scheduler = task_info.get("owner")
+                            if from_scheduler and hasattr(from_scheduler, "_scheduler_loop"):
+                                new_task = asyncio.create_task(from_scheduler._scheduler_loop())
+                                self.tasks[task_id] = {
+                                    "task": new_task,
+                                    "start_time": datetime.datetime.now(),
+                                    "description": description,
+                                    "owner": from_scheduler
+                                }
+                                logger.info("Создан новый цикл планировщика взамен зависшего")
+                                continue
                         
                         self.unregister_task(task_id)
             except Exception as e:

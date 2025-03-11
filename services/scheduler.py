@@ -3,7 +3,9 @@ import datetime
 import random
 import signal
 import sys
-from typing import Any, Dict, List, Set
+import time
+import traceback
+from typing import Any, Dict, List, Optional, Set
 
 from config.logging_config import logger
 from database.manager import DatabaseManager
@@ -17,11 +19,14 @@ class TaskWatchdog:
         self.timeout_seconds = timeout_seconds
         self.running = False
         self._watchdog_task = None
+        self._scheduler_restart_count = 0
+        self._last_restart_time = None
         
         
     async def start(self):
         self.running = True
         self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+        logger.info("Сторожевой таймер запущен")
        
         
     async def stop(self):
@@ -32,19 +37,22 @@ class TaskWatchdog:
                 await self._watchdog_task
             except asyncio.CancelledError:
                 pass
+        logger.info("Сторожевой таймер остановлен")
     
     
-    def register_task(self, task_id: int, task: asyncio.Task, description: str):
+    def register_task(self, task_id: int, task: asyncio.Task, description: str, owner=None):
         self.tasks[task_id] = {
             "task": task,
             "start_time": datetime.datetime.now(),
-            "description": description
+            "description": description,
+            "owner": owner
         }
+        logger.debug(f"Задача зарегистрирована: {description} (ID: {task_id})")
         
         
     def unregister_task(self, task_id: int):
-
         if task_id in self.tasks:
+            logger.debug(f"Задача снята с регистрации: {self.tasks[task_id]['description']} (ID: {task_id})")
             del self.tasks[task_id]
     
     
@@ -57,38 +65,89 @@ class TaskWatchdog:
                     start_time = task_info["start_time"]
                     description = task_info["description"]
                     
+                    # Проверка на зависшие задачи
                     if not task.done() and (now - start_time).total_seconds() > self.timeout_seconds:
                         logger.warning(f"Обнаружена зависшая задача: {description}. "
                                     f"Выполняется {(now - start_time).total_seconds():.1f} секунд. Перезапуск...")
                         
                         task.cancel()
                         
-                        # Если это основной цикл планировщика, создаем новый
                         if task_id == -1 and description == "Основной цикл планировщика":
-                            # Дожидаемся завершения старой задачи
-                            try:
-                                await asyncio.wait_for(task, timeout=5.0)
-                            except (asyncio.CancelledError, asyncio.TimeoutError):
-                                pass
-                            
-                            # Создаем новый цикл планировщика
-                            from_scheduler = task_info.get("owner")
-                            if from_scheduler and hasattr(from_scheduler, "_scheduler_loop"):
-                                new_task = asyncio.create_task(from_scheduler._scheduler_loop())
-                                self.tasks[task_id] = {
-                                    "task": new_task,
-                                    "start_time": datetime.datetime.now(),
-                                    "description": description,
-                                    "owner": from_scheduler
-                                }
-                                logger.info("Создан новый цикл планировщика взамен зависшего")
-                                continue
-                        
-                        self.unregister_task(task_id)
+                            await self._try_restart_scheduler_task(task_id, task_info)
+                        else:
+                            self.unregister_task(task_id)
+                    
+                    elif task.done() and not task.cancelled():
+                        try:
+                            exception = task.exception()
+                            if exception:
+                                logger.error(f"Задача {description} (ID: {task_id}) завершилась с ошибкой: {exception}")
+                                
+                                if task_id == -1 and description == "Основной цикл планировщика":
+                                    await self._try_restart_scheduler_task(task_id, task_info)
+                                else:
+                                    self.unregister_task(task_id)
+                        except (asyncio.CancelledError, asyncio.InvalidStateError):
+                            pass
+                
+                await asyncio.sleep(10)
+                
+            except asyncio.CancelledError:
+                logger.info("Сторожевой таймер отменен")
+                break
             except Exception as e:
                 logger.error(f"Ошибка в сторожевом таймере: {str(e)}")
-                
-            await asyncio.sleep(30)
+                logger.error(traceback.format_exc())
+                await asyncio.sleep(10)
+    
+    
+    async def _try_restart_scheduler_task(self, task_id: int, task_info: Dict):
+        """Пытается перезапустить основной цикл планировщика."""
+        try:
+            now = datetime.datetime.now()
+            
+
+            if self._last_restart_time and (now - self._last_restart_time).total_seconds() < 300:  # 5 минут
+                self._scheduler_restart_count += 1
+                if self._scheduler_restart_count > 5:
+                    logger.critical("Слишком много перезапусков планировщика. Возможна критическая проблема.")
+                    self._scheduler_restart_count = 0
+                    await asyncio.sleep(30)
+            else:
+                self._scheduler_restart_count = 1
+            
+            self._last_restart_time = now
+            
+            old_task = task_info["task"]
+            owner = task_info.get("owner")
+            
+            if not owner or not hasattr(owner, "_scheduler_loop"):
+                logger.error("Не удалось получить экземпляр планировщика для перезапуска")
+                self.unregister_task(task_id)
+                return
+            
+            try:
+                await asyncio.wait_for(asyncio.shield(old_task), timeout=10.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+            
+            logger.info("Создаю новый цикл планировщика")
+            
+            new_task = asyncio.create_task(owner._scheduler_loop())
+            
+            self.tasks[task_id] = {
+                "task": new_task,
+                "start_time": datetime.datetime.now(),
+                "description": task_info["description"],
+                "owner": owner
+            }
+            
+            logger.success("Планировщик успешно перезапущен")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при перезапуске планировщика: {str(e)}")
+            logger.error(traceback.format_exc())
+            self.unregister_task(task_id)
 
 
 class TaskScheduler:    
@@ -99,8 +158,11 @@ class TaskScheduler:
         self.running = False
         self.tasks = {}
         self.scheduler_task = None
-        self.watchdog = TaskWatchdog(timeout_seconds=1800)  
+        self.watchdog = TaskWatchdog(timeout_seconds=1800)
         self.busy_accounts: Set[int] = set()
+        self.last_activity_time = time.time()
+        self.health_check_task = None
+        self.scheduler_loop_id = -1
     
     
     async def start(self):
@@ -114,7 +176,9 @@ class TaskScheduler:
         self._initialize_account_schedules()
         
         self.scheduler_task = asyncio.create_task(self._scheduler_loop())
-        self.watchdog.register_task(-1, self.scheduler_task, "Основной цикл планировщика")
+        self.watchdog.register_task(self.scheduler_loop_id, self.scheduler_task, "Основной цикл планировщика", owner=self)
+        
+        self.health_check_task = asyncio.create_task(self._health_check_loop())
         
         logger.success("Планировщик запущен и работает. Нажмите Ctrl+C для завершения.")
     
@@ -124,6 +188,9 @@ class TaskScheduler:
         self.running = False
         
         await self.watchdog.stop()
+        
+        if self.health_check_task and not self.health_check_task.done():
+            self.health_check_task.cancel()
         
         if self.scheduler_task and not self.scheduler_task.done():
             self.scheduler_task.cancel()
@@ -158,7 +225,46 @@ class TaskScheduler:
             loop = asyncio.get_event_loop()
             loop.add_signal_handler(signal.SIGINT, signal_handler)
             loop.add_signal_handler(signal.SIGTERM, signal_handler)
+    
+    
+    async def _health_check_loop(self):
+        check_interval = 60
+        inactivity_threshold = 600
         
+        while self.running:
+            try:
+                current_time = time.time()
+                
+                inactive_period = current_time - self.last_activity_time
+                
+                if inactive_period > inactivity_threshold:
+                    logger.warning(f"Обнаружен длительный период неактивности планировщика: {inactive_period:.1f} секунд")
+                    
+                    if self.scheduler_task and not self.scheduler_task.done():
+                        logger.warning("Принудительный перезапуск планировщика из-за неактивности")
+                        old_task = self.scheduler_task
+                        old_task.cancel()
+                        
+                        try:
+                            await asyncio.wait_for(asyncio.shield(old_task), timeout=10.0)
+                        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                            pass
+                        
+                        self.scheduler_task = asyncio.create_task(self._scheduler_loop())
+                        self.watchdog.register_task(self.scheduler_loop_id, self.scheduler_task, "Основной цикл планировщика", owner=self)
+                        
+                        self.last_activity_time = current_time
+                    
+                await asyncio.sleep(check_interval)
+                
+            except asyncio.CancelledError:
+                logger.info("Задача проверки здоровья планировщика отменена")
+                break
+            except Exception as e:
+                logger.error(f"Ошибка в _health_check_loop: {str(e)}")
+                logger.error(traceback.format_exc())
+                await asyncio.sleep(check_interval)
+    
     
     def _initialize_account_schedules(self):
         with self.db_manager.session_scope() as session:
@@ -201,10 +307,12 @@ class TaskScheduler:
     
     
     async def _scheduler_loop(self):
-        check_interval = 30
+        check_interval = 15
         
         while self.running:
             try:
+                self.last_activity_time = time.time()
+                
                 self._clean_completed_tasks()
                 
                 accounts_to_run = self._get_accounts_to_run()
@@ -233,6 +341,7 @@ class TaskScheduler:
                 raise
             except Exception as e:
                 logger.error(f"Ошибка в цикле планировщика: {str(e)}")
+                logger.error(traceback.format_exc())
                 await asyncio.sleep(check_interval)
     
     
@@ -240,36 +349,40 @@ class TaskScheduler:
         current_time = datetime.datetime.now()
         accounts_to_run = []
         
-        with self.db_manager.session_scope() as session:
-            repo = AccountRepository(session)
-            active_accounts = repo.get_active_accounts()
-            
-            for account in active_accounts:
-                if not account.next_run_time:
-                    continue
-                    
-                try:
-                    account_id = account.id
-                    if not isinstance(account_id, (int, str, float, bool, tuple)):
-                        logger.error(f"Некорректный тип ID аккаунта {account.username}: {type(account_id)}")
+        try:
+            with self.db_manager.session_scope() as session:
+                repo = AccountRepository(session)
+                active_accounts = repo.get_active_accounts()
+                
+                for account in active_accounts:
+                    if not account.next_run_time:
                         continue
-                    
-                    if (account_id not in self.busy_accounts and 
-                        account_id not in self.tasks and 
-                        account.next_run_time <= current_time):
                         
-                        accounts_to_run.append(account_id)
+                    try:
+                        account_id = account.id
+                        if not isinstance(account_id, (int, str, float, bool, tuple)):
+                            logger.error(f"Некорректный тип ID аккаунта {account.username}: {type(account_id)}")
+                            continue
                         
-                        delta = current_time - account.next_run_time
-                        minutes_ago = int(delta.total_seconds() / 60)
-                        
-                        if minutes_ago > 0:
-                            logger.info(f"Запуск {account.username} (запланирован {minutes_ago} мин. назад)")
-                        else:
-                            logger.info(f"Запуск {account.username} (время выполнения)")
-                except TypeError as e:
-                    logger.error(f"Ошибка при проверке задачи для аккаунта {account.username}: {str(e)}")
-                    continue
+                        if (account_id not in self.busy_accounts and 
+                            account_id not in self.tasks and 
+                            account.next_run_time <= current_time):
+                            
+                            accounts_to_run.append(account_id)
+                            
+                            delta = current_time - account.next_run_time
+                            minutes_ago = int(delta.total_seconds() / 60)
+                            
+                            if minutes_ago > 0:
+                                logger.info(f"Запуск {account.username} (запланирован {minutes_ago} мин. назад)")
+                            else:
+                                logger.info(f"Запуск {account.username} (время выполнения)")
+                    except TypeError as e:
+                        logger.error(f"Ошибка при проверке задачи для аккаунта {account.username}: {str(e)}")
+                        continue
+        except Exception as e:
+            logger.error(f"Ошибка в _get_accounts_to_run: {str(e)}")
+            logger.error(traceback.format_exc())
         
         return accounts_to_run
         
@@ -331,6 +444,10 @@ class TaskScheduler:
                         logger.info(f"Из-за таймаута следующий запуск для {account.username} запланирован через 1 час")
                 
                 return {"error": "Превышено время выполнения", "success": False}
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка в _execute_account_tasks_with_timeout для аккаунта {account_id}: {str(e)}")
+            logger.error(traceback.format_exc())
+            return {"error": str(e), "success": False}
         finally:
             if account_id in self.busy_accounts:
                 self.busy_accounts.remove(account_id)
@@ -361,6 +478,7 @@ class TaskScheduler:
             raise
         except Exception as e:
             logger.error(f"Ошибка при выполнении задач для аккаунта {account_id}: {str(e)}")
+            logger.error(traceback.format_exc())
             with self.db_manager.session_scope() as session:
                 repo = AccountRepository(session)
                 account = repo.get_by_id(account_id)

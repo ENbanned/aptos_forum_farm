@@ -35,7 +35,7 @@ def setup_application() -> tuple:
         sys.exit(1)
     
     openai_api_key = config.get_openai_api_key() if config else ""
-    account_service = AccountService(db_manager, openai_api_key)
+    account_service = AccountService(db_manager, openai_api_key, config)
     
     csv_path = files_dir / "accounts.csv"
     if not csv_path.exists():
@@ -166,15 +166,15 @@ async def main_async():
                 await scheduler.start()
                 logger.success("\nПланировщик запущен. Нажмите Ctrl+C для завершения.")
                 
-                watchdog_task = asyncio.create_task(scheduler_watchdog(scheduler))
+                scheduler_monitor_task = asyncio.create_task(scheduler_monitor(scheduler, shutdown_event))
                 
                 try:
                     while not shutdown_event.is_set():
                         await asyncio.sleep(1)
                 finally:
-                    watchdog_task.cancel()
+                    scheduler_monitor_task.cancel()
                     with suppress(asyncio.CancelledError):
-                        await watchdog_task
+                        await scheduler_monitor_task
                     
                     logger.info("\nОстановка планировщика...")
                     await scheduler.stop()
@@ -193,6 +193,7 @@ async def main_async():
             await scheduler.stop()
     except Exception as e:
         logger.error(f"Критическая ошибка: {str(e)}")
+        logger.error(traceback.format_exc())
         if 'scheduler' in locals() and scheduler and scheduler.running:
             await scheduler.stop()
         sys.exit(1)
@@ -213,29 +214,81 @@ async def wait_for_event(event):
     return ""
 
 
-async def scheduler_watchdog(scheduler, check_interval=300):
-    last_check_time = time.time()
+async def scheduler_monitor(scheduler, shutdown_event, check_interval=60):
+    last_active_accounts_count = 0
+    scheduler_restart_count = 0
+    last_restart_time = None
     
-    while True:
+    while not shutdown_event.is_set():
         try:
             if not scheduler.running:
-                logger.warning("Сторожевой таймер: Планировщик не запущен, перезапускаем...")
-                await scheduler.start()
-            
-            current_time = time.time()
-            if current_time - last_check_time > check_interval:
-                logger.info("Сторожевой таймер: Проверка работоспособности планировщика...")
+                logger.warning("Монитор планировщика: Планировщик не запущен, перезапускаем...")
+                scheduler_restart_count += 1
                 
-                last_check_time = current_time
+                now = time.time()
+                if last_restart_time and now - last_restart_time < 300:
+                    if scheduler_restart_count > 3:
+                        logger.error("Слишком много перезапусков планировщика. Возможна серьезная ошибка.")
+                        await asyncio.sleep(60)
+                    
+                last_restart_time = now
+                
+                try:
+                    await scheduler.stop()
+                except Exception as stop_error:
+                    logger.error(f"Ошибка при остановке планировщика: {stop_error}")
+                
+                await asyncio.sleep(5)
+                
+                try:
+                    await scheduler.start()
+                    logger.success("Монитор планировщика: Планировщик успешно перезапущен")
+                except Exception as start_error:
+                    logger.error(f"Ошибка при перезапуске планировщика: {start_error}")
+            else:
+                active_tasks_count = len(scheduler.tasks)
+                busy_accounts_count = len(scheduler.busy_accounts)
+                
+                activity_changed = active_tasks_count != last_active_accounts_count
+                
+                if activity_changed:
+                    logger.debug(f"Монитор планировщика: Активных задач: {active_tasks_count}, Занятых аккаунтов: {busy_accounts_count}")
+                    last_active_accounts_count = active_tasks_count
+                
+                inactive_period = time.time() - scheduler.last_activity_time
+                if inactive_period > 300:
+                    logger.warning(f"Монитор планировщика: Длительный период неактивности планировщика: {inactive_period:.1f} секунд")
+                    
+                    try:
+                        accounts_to_check = scheduler._get_accounts_to_run()
+                        if accounts_to_check:
+                            logger.info(f"Монитор планировщика: Найдено {len(accounts_to_check)} аккаунтов для запуска")
+                    except Exception as scan_error:
+                        logger.error(f"Ошибка при проверке аккаунтов: {scan_error}")
             
-            await asyncio.sleep(60)
+            await asyncio.sleep(check_interval)
             
         except asyncio.CancelledError:
-            logger.info("Сторожевой таймер планировщика остановлен")
+            logger.info("Монитор планировщика остановлен")
             break
         except Exception as e:
-            logger.error(f"Ошибка в сторожевом таймере планировщика: {str(e)}")
-            await asyncio.sleep(60)
+            logger.error(f"Ошибка в мониторе планировщика: {str(e)}")
+            logger.error(traceback.format_exc())
+            await asyncio.sleep(check_interval)
+
+
+def custom_exception_handler(loop, context):
+    exception = context.get('exception')
+    message = context.get('message')
+    
+    if isinstance(exception, asyncio.CancelledError):
+        logger.debug(f"Задача отменена: {message}")
+        return
+        
+    logger.error(f"Необработанное исключение в асинхронном коде: {message}")
+    if exception:
+        logger.error(f"Исключение: {exception}")
+        logger.error(f"Трассировка: {traceback.format_exception(type(exception), exception, exception.__traceback__)}")
 
 
 def main():
@@ -263,20 +316,6 @@ def main():
         logger.error(f"Критическая ошибка: {str(e)}")
         traceback.print_exc()
         sys.exit(1)
-
-
-def custom_exception_handler(loop, context):
-    exception = context.get('exception')
-    message = context.get('message')
-    
-    if isinstance(exception, asyncio.CancelledError):
-        logger.debug(f"Задача отменена: {message}")
-        return
-        
-    logger.error(f"Необработанное исключение в асинхронном коде: {message}")
-    if exception:
-        logger.error(f"Исключение: {exception}")
-        logger.error(f"Трассировка: {traceback.format_exception(type(exception), exception, exception.__traceback__)}")
 
 
 if __name__ == "__main__":

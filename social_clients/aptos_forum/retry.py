@@ -22,19 +22,13 @@ class RetryableRequest:
         self.max_delay = max_delay
         self.retry_on_status_codes = retry_on_status_codes
     
-    def __call__(self, func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
+    def __call__(self, func):
         @functools.wraps(func)
-        async def wrapper(*args: Any, **kwargs: Any) -> T:
+        async def wrapper(*args, **kwargs):
             last_exception = None
             
             for attempt in range(1, self.max_retries + 1):
                 try:
-                    if 'timeout' not in kwargs and func.__name__ != 'request':
-                        if 'poll' in func.__name__.lower():
-                            kwargs['timeout'] = 45.0
-                        else:
-                            kwargs['timeout'] = 30.0
-                    
                     result = await func(*args, **kwargs)
                     
                     if hasattr(result, 'status_code') and result.status_code in self.retry_on_status_codes:
@@ -43,7 +37,6 @@ class RetryableRequest:
                             f"Повторная попытка {attempt}/{self.max_retries}."
                         )
                         
-                        # Экспоненциальная задержка с джиттером
                         delay = min(self.max_delay, self.base_delay * (2 ** (attempt - 1)))
                         delay = delay * (0.8 + 0.4 * random.random())
                         
@@ -72,7 +65,7 @@ class RetryableRequest:
                     )
                     
                     delay = min(self.max_delay, self.base_delay * (2 ** (attempt - 1)))
-                    delay = delay * (0.8 + 0.4 * random.random())  # джиттер ±20%
+                    delay = delay * (0.8 + 0.4 * random.random())
                     
                     await asyncio.sleep(delay)
             

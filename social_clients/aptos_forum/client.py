@@ -749,7 +749,8 @@ class AptosForumClient:
             if not self._client:
                 return False
             
-            await self.rate_limiter.wait_if_needed()
+            if hasattr(self, 'rate_limiter'):
+                await self.rate_limiter.wait_if_needed()
                     
             poll_url = f"{self.base_url}/message-bus/{message_bus_id}/poll"
             
@@ -838,7 +839,8 @@ class AptosForumClient:
             if not self._client:
                 return False
             
-            await self.rate_limiter.wait_if_needed()
+            if hasattr(self, 'rate_limiter'):
+                await self.rate_limiter.wait_if_needed()
                 
             url = f"{self.base_url}/topics/timings"
             

@@ -18,6 +18,10 @@ from .decorators import (
 from .models import AccountCredentials, PostData, TopicData
 from .utils import extract_text_from_html, is_success_response
 
+from .retry import RetryableRequest
+from .rate_limiter import RateLimiter
+from .session_manager import ClientSessionManager
+
 
 class AptosForumClient:
     def __init__(
@@ -37,6 +41,13 @@ class AptosForumClient:
         self._username: Optional[str] = None
         
         self._ip_timezone_cache: Dict[str, str] = {}
+        
+        self.rate_limiter = RateLimiter(
+            requests_per_minute=30,
+            burst_limit=5,
+            burst_period=5.0
+        )
+        self.session_manager = ClientSessionManager(self)
     
     
     async def __aenter__(self) -> 'AptosForumClient':
@@ -731,10 +742,14 @@ class AptosForumClient:
         response = await self._client.get(url)
         return response.json()
     
+    
+    @RetryableRequest(max_retries=2, base_delay=2.0)
     async def _send_poll_request(self, message_bus_id: str, seq_num: int, topic_id: int) -> bool:
         try:
             if not self._client:
                 return False
+            
+            await self.rate_limiter.wait_if_needed()
                     
             poll_url = f"{self.base_url}/message-bus/{message_bus_id}/poll"
             
@@ -793,7 +808,7 @@ class AptosForumClient:
             
             response = await asyncio.wait_for(
                 self._client.post(poll_url, data=form_data, headers=headers),
-                timeout=60
+                timeout=45.0
             )
             
             logger.debug(f"_send_poll_request - статус: {response.status_code}")
@@ -805,6 +820,8 @@ class AptosForumClient:
                 return True
             else:
                 logger.warning(f"Ошибка poll-запроса: HTTP {response.status_code}")
+                if response.status_code in (401, 403) and hasattr(self, 'session_manager'):
+                    await self.session_manager.maybe_refresh_session(force=True)
                 return False
                 
         except asyncio.TimeoutError:
@@ -815,10 +832,13 @@ class AptosForumClient:
             return False
 
 
+    @RetryableRequest()
     async def _send_timing_data(self, topic_id: int, timings: Dict[str, int], topic_time: int) -> bool:
         try:
             if not self._client:
                 return False
+            
+            await self.rate_limiter.wait_if_needed()
                 
             url = f"{self.base_url}/topics/timings"
             
@@ -837,6 +857,9 @@ class AptosForumClient:
                 'x-silence-logger': 'true'
             }
             
+            if self._csrf_token:
+                headers['x-csrf-token'] = self._csrf_token
+            
             response = await asyncio.wait_for(
                 self._client.post(url, data=data, headers=headers),
                 timeout=15
@@ -844,7 +867,14 @@ class AptosForumClient:
             
             logger.debug(f"_send_timing_data - статус: {response.status_code}")
             
-            return response.status_code == 200
+            if response.status_code == 200:
+                return True
+            else:
+                logger.warning(f"Ошибка при отправке timing данных: HTTP {response.status_code}")
+                if response.status_code in (401, 403) and hasattr(self, 'session_manager'):
+                    await self.session_manager.maybe_refresh_session(force=True)
+                return False
+                
         except asyncio.TimeoutError:
             logger.warning("Таймаут при отправке данных о времени просмотра")
             return False

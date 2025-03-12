@@ -18,7 +18,6 @@ from .decorators import (
 from .models import AccountCredentials, PostData, TopicData
 from .utils import extract_text_from_html, is_success_response
 
-from .retry import RetryableRequest
 from .rate_limiter import RateLimiter
 from .session_manager import ClientSessionManager
 

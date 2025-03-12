@@ -4,6 +4,7 @@ import os
 import time
 import traceback
 import signal
+import socket
 from pathlib import Path
 from contextlib import suppress
 
@@ -293,20 +294,31 @@ def custom_exception_handler(loop, context):
 
 def main():
     try:
+        if sys.platform == 'win32':
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            
+            socket.setdefaulttimeout(60)
+            
         files_dir = Path("files")
         files_dir.mkdir(exist_ok=True)
         
-        if sys.version_info >= (3, 8):
-            loop_policy = asyncio.get_event_loop_policy()
-            loop = loop_policy.new_event_loop()
-            loop.set_exception_handler(custom_exception_handler)
-            asyncio.set_event_loop(loop)
+        loop = asyncio.new_event_loop()
+        loop.set_exception_handler(custom_exception_handler)
+        asyncio.set_event_loop(loop)
+        
+        try:
             loop.run_until_complete(main_async())
-            loop.close()
-        else:
-            loop = asyncio.get_event_loop()
-            loop.set_exception_handler(custom_exception_handler)
-            loop.run_until_complete(main_async())
+        finally:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(asyncio.sleep(0.1))
             loop.close()
         
     except KeyboardInterrupt:

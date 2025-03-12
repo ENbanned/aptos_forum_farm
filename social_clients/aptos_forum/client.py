@@ -61,8 +61,12 @@ class AptosForumClient:
 
     async def close(self) -> None:
         if self._client:
-            await self._client.close()
-            self._client = None
+            try:
+                await self._client.close()
+            except Exception as e:
+                logger.error(f"Ошибка при закрытии клиента: {e}")
+            finally:
+                self._client = None
     
     # -------------------------------------------------------------------------
     # Методы инициализации и авторизации
@@ -76,11 +80,19 @@ class AptosForumClient:
                 logger.info(f"Попытка #{attempt} инициализации клиента для {self._credentials.username}" + 
                         (f" с прокси {self._proxy}" if self._proxy else " без прокси"))
                 
+                if self._client:
+                    try:
+                        await self._client.close()
+                    except Exception:
+                        pass
+                    self._client = None
+                
                 self._client = TLSClient(
                     proxy=self._proxy, 
                     disable_ssl=True,
                     randomize_fingerprint=True,
-                    headers=self._get_default_headers()
+                    headers=self._get_default_headers(),
+                    timeout=60.0
                 )
                 
                 if not await self._ensure_authenticated():
@@ -553,9 +565,10 @@ class AptosForumClient:
             logger.info(f"Выбрана тема для симуляции онлайн: {topic.title or 'Без названия'} (ID: {topic.id})")
             
             try:
-                initial_response = await asyncio.wait_for(
-                    self._client.get(f"{self.base_url}/t/{topic.id}"),
-                    timeout=40
+                initial_response = await self._client.get(
+                    f"{self.base_url}/t/{topic.id}", 
+                    max_retries=2, 
+                    retry_delay=2.0
                 )
                 
                 if initial_response.status_code != 200:
@@ -667,7 +680,7 @@ class AptosForumClient:
         for i in range(count):
             logger.info(f"Просмотр темы {i+1} из {count}")
             
-            topics = await self.get_latest_topics(page=random.randint(0, 5))
+            topics = await self.get_latest_topics(page=random.randint(0, 10))
             if not topics:
                 logger.warning("Не удалось получить список тем")
                 continue
@@ -743,7 +756,6 @@ class AptosForumClient:
         return response.json()
     
     
-    @RetryableRequest(max_retries=2, base_delay=2.0)
     async def _send_poll_request(self, message_bus_id: str, seq_num: int, topic_id: int) -> bool:
         try:
             if not self._client:
@@ -807,9 +819,12 @@ class AptosForumClient:
             if self._csrf_token:
                 headers['x-csrf-token'] = self._csrf_token
             
-            response = await asyncio.wait_for(
-                self._client.post(poll_url, data=form_data, headers=headers),
-                timeout=45.0
+            response = await self._client.post(
+                poll_url, 
+                data=form_data, 
+                headers=headers,
+                max_retries=3,
+                retry_delay=2.0
             )
             
             logger.debug(f"_send_poll_request - статус: {response.status_code}")
@@ -824,16 +839,12 @@ class AptosForumClient:
                 if response.status_code in (401, 403) and hasattr(self, 'session_manager'):
                     await self.session_manager.maybe_refresh_session(force=True)
                 return False
-                
-        except asyncio.TimeoutError:
-            logger.warning("Таймаут при отправке poll-запроса")
-            return False
+                    
         except Exception as e:
             logger.error(f"Ошибка при отправке poll-запроса: {e}")
             return False
 
 
-    @RetryableRequest()
     async def _send_timing_data(self, topic_id: int, timings: Dict[str, int], topic_time: int) -> bool:
         try:
             if not self._client:
@@ -862,9 +873,12 @@ class AptosForumClient:
             if self._csrf_token:
                 headers['x-csrf-token'] = self._csrf_token
             
-            response = await asyncio.wait_for(
-                self._client.post(url, data=data, headers=headers),
-                timeout=15
+            response = await self._client.post(
+                url, 
+                data=data, 
+                headers=headers,
+                max_retries=3,
+                retry_delay=1.5
             )
             
             logger.debug(f"_send_timing_data - статус: {response.status_code}")
@@ -877,9 +891,6 @@ class AptosForumClient:
                     await self.session_manager.maybe_refresh_session(force=True)
                 return False
                 
-        except asyncio.TimeoutError:
-            logger.warning("Таймаут при отправке данных о времени просмотра")
-            return False
         except Exception as e:
             logger.error(f"Ошибка при отправке данных о времени просмотра: {str(e)}")
             return False
@@ -891,7 +902,7 @@ class AptosForumClient:
                 return False
                 
             url = f"{self.base_url}/t/{topic_id}"
-            response = await self._client.get(url)
+            response = await self._client.get(url, max_retries=3)
             
             if response.status_code == 200:
                 timings = {str(i): random.randint(1000, 5000) for i in range(1, 3)}

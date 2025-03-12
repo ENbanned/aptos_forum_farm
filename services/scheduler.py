@@ -308,41 +308,74 @@ class TaskScheduler:
     
     async def _scheduler_loop(self):
         check_interval = 15
+        max_iteration_time = 45
         
         while self.running:
+            iteration_start = time.time()
+            
             try:
-                self.last_activity_time = time.time()
-                
-                self._clean_completed_tasks()
-                
-                accounts_to_run = self._get_accounts_to_run()
-                
-                for account_id in accounts_to_run:
-                    if account_id in self.busy_accounts:
-                        continue
-                        
-                    with self.db_manager.session_scope() as session:
-                        repo = AccountRepository(session)
-                        account = repo.get_by_id(account_id)
-                        if account:
-                            logger.success(f"Запуск задач для аккаунта {account.username}")
-                            
-                            self.busy_accounts.add(account_id)
-                            
-                            task = asyncio.create_task(self._execute_account_tasks_with_timeout(account_id))
-                            self.tasks[account_id] = task
-                            
-                            self.watchdog.register_task(account_id, task, f"Задача для аккаунта {account.username}")
-                
-                await asyncio.sleep(check_interval)
-                
+                iteration_task = asyncio.create_task(self._run_scheduler_iteration())
+                try:
+                    await asyncio.wait_for(iteration_task, timeout=max_iteration_time)
+                except asyncio.TimeoutError:
+                    logger.warning("Итерация планировщика заняла слишком много времени и была прервана")
+                    iteration_task.cancel()
+                    try:
+                        await iteration_task
+                    except asyncio.CancelledError:
+                        pass
+                    
+                    self._emergency_cleanup()
+                except Exception as e:
+                    logger.error(f"Ошибка при выполнении итерации: {str(e)}")
+                    
             except asyncio.CancelledError:
                 logger.info("Цикл планировщика отменен")
                 raise
             except Exception as e:
                 logger.error(f"Ошибка в цикле планировщика: {str(e)}")
                 logger.error(traceback.format_exc())
-                await asyncio.sleep(check_interval)
+            
+            elapsed = time.time() - iteration_start
+            sleep_time = max(1, check_interval - elapsed)
+            await asyncio.sleep(sleep_time)
+            
+    async def _run_scheduler_iteration(self):
+        self.last_activity_time = time.time()
+        
+        self._clean_completed_tasks()
+        
+        accounts_to_run = self._get_accounts_to_run()
+        
+        for account_id in accounts_to_run:
+            if account_id in self.busy_accounts:
+                continue
+                
+            try:
+                with self.db_manager.session_scope() as session:
+                    repo = AccountRepository(session)
+                    account = repo.get_by_id(account_id)
+                    if account:
+                        logger.success(f"Запуск задач для аккаунта {account.username}")
+                        self.busy_accounts.add(account_id)
+                        task = asyncio.create_task(self._execute_account_tasks_with_timeout(account_id))
+                        self.tasks[account_id] = task
+                        self.watchdog.register_task(account_id, task, f"Задача для аккаунта {account.username}")
+            except Exception as e:
+                logger.error(f"Ошибка при запуске задачи для аккаунта {account_id}: {str(e)}")
+                logger.error(traceback.format_exc())
+                if account_id in self.busy_accounts:
+                    self.busy_accounts.remove(account_id)
+                    
+    def _emergency_cleanup(self):
+        for task_id, task in list(self.tasks.items()):
+            if not task.done() and task_id != self.scheduler_loop_id:
+                logger.warning(f"Принудительная отмена задачи {task_id}")
+                task.cancel()
+                
+        previously_busy = set(self.busy_accounts)
+        self.busy_accounts.clear()
+        logger.warning(f"Сброшены занятые аккаунты: {previously_busy}")
     
     
     def _get_accounts_to_run(self) -> List[int]:
